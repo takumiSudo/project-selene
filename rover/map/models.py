@@ -145,18 +145,34 @@ class CascadeStep(BaseModel):
     pod_id: str
     failure_mode: str                        # e.g. "loses electrical_power from helios"
     hop: int = 0                             # 1 = direct dep, 2+ = transitive
-    estimated_window_hours: float | None = None  # survival window from pod metadata
+    estimated_window_hours: float | None = None  # this pod's own buffer for the lost resource
+    cumulative_hours: float | None = None    # min time from T=0 (trigger) until this pod fails
     evidence_source: str = ""               # e.g. "metadata:backup_power_hours=4"
     is_life_critical: bool = False          # oxygen, power, medical resources
+    is_compound: bool = False               # pod is in same SCC as trigger (mutual destruction)
+    immediate_supplier: str = ""             # which upstream pod provides the lost resource
+    lost_resource: str = ""                 # explicit resource name
+
+
+class CascadeSurvivor(BaseModel):
+    """A pod that survives a cascade either by independence or by sufficient buffer."""
+    pod_id: str
+    reason: str                              # e.g. "independent — no operational path"
+    evidence: list[str] = Field(default_factory=list)  # metadata + structural evidence
 
 
 class CascadeSimulation(BaseModel):
-    """Full failure cascade rooted at one articulation point."""
+    """Full failure cascade rooted at a corroborated SPOF."""
     trigger_pod: str
     trigger_reason: str
+    corroboration_signals: list[str] = Field(default_factory=list)  # why this pod was selected
+    direct_dependents: list[str] = Field(default_factory=list)       # hop=1 pods (operational)
+    compound_dependents: list[str] = Field(default_factory=list)     # in trigger's SCC (mutual)
     steps: list[CascadeStep] = Field(default_factory=list)
+    survivors: list[CascadeSurvivor] = Field(default_factory=list)
     total_pods_affected: int = 0
     time_to_life_critical_hours: float | None = None  # fastest path to life-critical failure
+    time_to_colony_wide_hours: float | None = None    # max cumulative — when everyone has fallen
 
 
 # ---------------------------------------------------------------------------

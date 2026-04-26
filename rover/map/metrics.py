@@ -31,8 +31,10 @@ from .models import (
     BlastRadiusEntry,
     CascadeSimulation,
     CascadeStep,
+    CascadeSurvivor,
     CommEntry,
     DependencyEdge,
+    EdgeState,
     ExtendedMetrics,
     HistoricalEdge,
     LLMDerivedSignal,
@@ -189,9 +191,6 @@ def _compute_structural(
             blast_radius_weighted=weighted,
         )
 
-    # ── Cascade simulations (one per articulation point) ─────────────────
-    cascade_sims = _compute_cascades(pods, G, art_points)
-
     # ── Rankings ─────────────────────────────────────────────────────────
     highest_blast = sorted(
         blast_radius, key=lambda p: blast_radius[p].blast_radius_count, reverse=True
@@ -206,95 +205,444 @@ def _compute_structural(
         strongly_connected_components=sccs,
         longest_path=longest,
         blast_radius=blast_radius,
-        cascade_simulations=cascade_sims,
         highest_blast_radius=highest_blast,
         G=G,   # passed to later layers, removed before building ExtendedMetrics
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CASCADE SIMULATION — runs after Layers A+B so it can use risk + metadata + logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Pods marked as survivors must show buffer >= this many hours past the cascade
+# front-line failure window.  One week ≈ "the colony is in crisis anyway."
+_SURVIVOR_BUFFER_HOURS = 7 * 24
+
+# Maximum cascade triggers to simulate per run (avoid combinatorial output).
+_MAX_TRIGGERS = 4
+
+
 def _compute_cascades(
     pods: dict[str, PodNode],
-    G: nx.DiGraph,
-    art_points: list[str],
+    edges: list[DependencyEdge],
+    structural: dict,
+    metadata_signals: list[MetadataSignal],
+    historical_edges: list[HistoricalEdge],
+    risk_scores: dict[str, RiskScore],
 ) -> list[CascadeSimulation]:
-    simulations: list[CascadeSimulation] = []
+    """Multi-layer cascade simulation rooted at corroborated SPOFs.
 
-    for trigger in art_points:
-        steps = _cascade_steps(pods, G, trigger)
-        life_critical_times = [
-            s.estimated_window_hours
-            for s in steps
-            if s.is_life_critical and s.estimated_window_hours is not None
-        ]
-        simulations.append(CascadeSimulation(
-            trigger_pod=trigger,
-            trigger_reason=f"Articulation point — removing {trigger} disconnects the colony graph",
-            steps=steps,
-            total_pods_affected=len(steps),
-            time_to_life_critical_hours=min(life_critical_times) if life_critical_times else None,
-        ))
+    Differs from the old articulation-point-only approach in four ways:
+      1. Triggers are picked from corroborated risk_scores, not just APs.
+      2. Only operational edges (RECONCILED + DEP_ONLY) traverse the graph.
+         SUPPLY_ONLY admin oversight is filtered out.
+      3. SCC membership flags compound failures — a trigger that depends on
+         one of its own dependents (mutual destruction loop, e.g. aquifer↔helios).
+      4. Survivors are classified by metadata resilience markers, not just
+         graph reachability.
+    """
+    triggers = _select_cascade_triggers(structural, risk_scores)
+    if not triggers:
+        return []
+
+    G_ops = _build_operational_graph(pods, edges)
+    R_ops = G_ops.reverse(copy=True)
+    sccs = list(nx.strongly_connected_components(G_ops))
+
+    simulations: list[CascadeSimulation] = []
+    for trigger in triggers:
+        if trigger not in G_ops:
+            continue
+        sim = _simulate_one_cascade(
+            trigger=trigger,
+            pods=pods,
+            edges=edges,
+            G_ops=G_ops,
+            R_ops=R_ops,
+            sccs=sccs,
+            structural=structural,
+            metadata_signals=metadata_signals,
+            historical_edges=historical_edges,
+            risk_scores=risk_scores,
+        )
+        # Skip cascades that affect nothing operationally — these triggers were
+        # ranked highly by formal blast_radius (which counts admin oversight)
+        # but have no operational dependents.  Reporting them is just noise.
+        if sim.total_pods_affected == 0 and not sim.compound_dependents:
+            logger.debug("Cascade [%s] skipped — no operational dependents", trigger)
+            continue
+        simulations.append(sim)
 
     return simulations
 
 
-def _cascade_steps(
+def _select_cascade_triggers(
+    structural: dict,
+    risk_scores: dict[str, RiskScore],
+) -> list[str]:
+    """Pick cascade roots: APs first, then corroborated SPOFs, then top-1 by risk."""
+    triggers: list[str] = list(dict.fromkeys(structural.get("articulation_points", [])))
+
+    by_risk = sorted(
+        risk_scores.values(), key=lambda r: r.overall_risk, reverse=True
+    )
+
+    # Pods with >= 2 independent SPOF signals
+    for rs in by_risk:
+        if rs.spof_corroboration_count >= 2 and rs.pod_id not in triggers:
+            triggers.append(rs.pod_id)
+
+    # Always include the top-ranked pod even if corroboration is weak
+    if by_risk and by_risk[0].pod_id not in triggers:
+        triggers.insert(0, by_risk[0].pod_id)
+
+    # Include any pod with blast >= 0.7 if we still have room (catches obvious SPOFs
+    # that don't quite hit corroboration=2 because they have no metadata flag)
+    for rs in by_risk:
+        if rs.blast_radius_score >= 0.7 and rs.pod_id not in triggers:
+            triggers.append(rs.pod_id)
+        if len(triggers) >= _MAX_TRIGGERS:
+            break
+
+    return triggers[:_MAX_TRIGGERS]
+
+
+def _build_operational_graph(
     pods: dict[str, PodNode],
-    G: nx.DiGraph,
+    edges: list[DependencyEdge],
+) -> nx.DiGraph:
+    """Like _build_graph but keeps only operational edges (RECONCILED + DEP_ONLY).
+
+    SUPPLY_ONLY edges are administrative oversight (e.g. Artemis claims to supply
+    `administrative_oversight` to all pods) and inflate the blast radius without
+    representing an actual operational dependency.  Filtering them gives the
+    cascade a faithful view of resource flow.
+    """
+    G = nx.DiGraph()
+    for pod_id in pods:
+        G.add_node(pod_id, name=pods[pod_id].display_name)
+    for e in edges:
+        if e.state == EdgeState.SUPPLY_ONLY:
+            continue
+        G.add_edge(
+            e.source, e.target,
+            resource=e.resource,
+            criticality=e.criticality.value,
+            weight=CRITICALITY_WEIGHT.get(e.criticality.value, 1),
+        )
+    return G
+
+
+def _simulate_one_cascade(
+    *,
     trigger: str,
-) -> list[CascadeStep]:
-    """BFS in the reverse graph from `trigger`, building ordered cascade steps."""
-    R = G.reverse(copy=False)
-    steps: list[CascadeStep] = []
-    visited = {trigger}
-    queue: deque[tuple[str, int]] = deque()
+    pods: dict[str, PodNode],
+    edges: list[DependencyEdge],
+    G_ops: nx.DiGraph,
+    R_ops: nx.DiGraph,
+    sccs: list[set[str]],
+    structural: dict,
+    metadata_signals: list[MetadataSignal],
+    historical_edges: list[HistoricalEdge],
+    risk_scores: dict[str, RiskScore],
+) -> CascadeSimulation:
+    """Build one CascadeSimulation rooted at `trigger`."""
+    # ── Determine trigger context ────────────────────────────────────────
+    trigger_scc = next((c for c in sccs if trigger in c and len(c) > 1), set())
+    direct_deps = sorted(R_ops.successors(trigger))
 
-    # Seed queue with direct dependents of trigger
-    for dependent in R.successors(trigger):   # in R, successor = original dependent
-        if dependent not in visited:
-            visited.add(dependent)
-            queue.append((dependent, 1))
-
+    # ── Reverse-BFS to find affected pods + hop ──────────────────────────
+    hop_of: dict[str, int] = {trigger: 0}
+    queue: deque[str] = deque([trigger])
     while queue:
-        pod_id, hop = queue.popleft()
-        resource, lost_from = _resource_lost(G, pod_id, trigger, hop)
-        timing = _survival_window(pods.get(pod_id), resource)
-        evidence = _timing_evidence(pods.get(pod_id), resource)
+        current = queue.popleft()
+        for dep in R_ops.successors(current):
+            if dep not in hop_of:
+                hop_of[dep] = hop_of[current] + 1
+                queue.append(dep)
 
+    affected = {p for p in hop_of if p != trigger}
+
+    # ── Cumulative time per pod (fixed-point relaxation) ─────────────────
+    cumulative, via = _compute_cumulative_times(trigger, pods, G_ops, R_ops, affected)
+
+    # ── Classify survivors before building steps ─────────────────────────
+    survivors = _classify_survivors(
+        trigger=trigger,
+        affected=affected,
+        all_pods=pods,
+        edges=edges,
+        metadata_signals=metadata_signals,
+        cumulative=cumulative,
+    )
+    survivor_ids = {s.pod_id for s in survivors}
+
+    # ── Build cascade steps for affected non-survivors ───────────────────
+    steps: list[CascadeStep] = []
+    for pod_id in affected:
+        if pod_id in survivor_ids:
+            continue
+        # Prefer the path that produced the cumulative time — this keeps
+        # failure_mode + lost_resource consistent with cumulative_hours.
+        # Fall back to graph shortest path when timing is unknown.
+        if via.get(pod_id):
+            supplier, resource = via[pod_id]
+        else:
+            resource, supplier = _resource_lost_via(G_ops, pod_id, trigger)
+        window = _survival_window(pods.get(pod_id), resource)
+        evidence = _timing_evidence(pods.get(pod_id), resource)
         steps.append(CascadeStep(
             pod_id=pod_id,
-            failure_mode=f"loses '{resource}' from {lost_from}",
-            hop=hop,
-            estimated_window_hours=timing,
+            failure_mode=f"loses '{resource}' from {supplier}",
+            hop=hop_of.get(pod_id, 1),
+            estimated_window_hours=window,
+            cumulative_hours=cumulative.get(pod_id),
             evidence_source=evidence,
             is_life_critical=resource in LIFE_CRITICAL_RESOURCES,
+            is_compound=pod_id in trigger_scc,
+            immediate_supplier=supplier,
+            lost_resource=resource,
         ))
 
-        for next_dep in R.successors(pod_id):
-            if next_dep not in visited:
-                visited.add(next_dep)
-                queue.append((next_dep, hop + 1))
+    steps.sort(key=lambda s: (s.hop, s.cumulative_hours if s.cumulative_hours is not None else 1e9, s.pod_id))
 
-    return sorted(steps, key=lambda s: (s.hop, s.pod_id))
+    # ── Aggregate timings ────────────────────────────────────────────────
+    life_critical_cums = [
+        s.cumulative_hours for s in steps
+        if s.is_life_critical and s.cumulative_hours is not None
+    ]
+    all_cums = [s.cumulative_hours for s in steps if s.cumulative_hours is not None]
+    time_to_life_critical = min(life_critical_cums) if life_critical_cums else None
+    time_to_colony_wide = max(all_cums) if all_cums else None
+
+    # ── Corroboration signals ────────────────────────────────────────────
+    corroboration = _trigger_corroboration(
+        trigger=trigger,
+        pods=pods,
+        structural=structural,
+        metadata_signals=metadata_signals,
+        historical_edges=historical_edges,
+        risk_scores=risk_scores,
+        affected_count=len(steps),
+    )
+
+    compound_pods = sorted(p for p in affected if p in trigger_scc and p not in survivor_ids)
+
+    return CascadeSimulation(
+        trigger_pod=trigger,
+        trigger_reason=_trigger_reason(trigger, structural, risk_scores),
+        corroboration_signals=corroboration,
+        direct_dependents=direct_deps,
+        compound_dependents=compound_pods,
+        steps=steps,
+        survivors=survivors,
+        total_pods_affected=len(steps),
+        time_to_life_critical_hours=time_to_life_critical,
+        time_to_colony_wide_hours=time_to_colony_wide,
+    )
 
 
-def _resource_lost(
-    G: nx.DiGraph, pod_id: str, trigger: str, hop: int
+def _compute_cumulative_times(
+    trigger: str,
+    pods: dict[str, PodNode],
+    G_ops: nx.DiGraph,
+    R_ops: nx.DiGraph,
+    affected: set[str],
+) -> tuple[dict[str, float | None], dict[str, tuple[str, str] | None]]:
+    """Fixed-point relaxation of cumulative survival time from T=0.
+
+    For each affected pod, the cumulative time = min over all parent paths of
+    (parent.cumulative + this_pod.window_for_lost_resource).  None means
+    the cumulative is unknown along every path (no metadata buffer).
+
+    Returns (cumulative, via) where via[pod_id] = (supplier, resource) for the
+    path that produced the minimum cumulative — used to label failure_mode
+    consistently with the timing.
+    """
+    cumulative: dict[str, float | None] = {trigger: 0.0}
+    via: dict[str, tuple[str, str] | None] = {trigger: None}
+    for pod_id in affected:
+        cumulative[pod_id] = None
+        via[pod_id] = None
+
+    # Relax until no changes (bounded by node count for a connected component)
+    for _ in range(len(affected) + 2):
+        changed = False
+        for pod_id in affected:
+            best: float | None = cumulative[pod_id]
+            best_via: tuple[str, str] | None = via[pod_id]
+            # For each upstream parent (in G_ops, this pod points TO its supplier)
+            for supplier in G_ops.successors(pod_id):
+                if supplier not in cumulative:
+                    continue
+                parent_cum = cumulative[supplier]
+                if parent_cum is None:
+                    continue
+                resource = G_ops[pod_id][supplier].get("resource", "unknown")
+                window = _survival_window(pods.get(pod_id), resource)
+                if window is None:
+                    continue
+                candidate = parent_cum + window
+                if best is None or candidate < best:
+                    best = candidate
+                    best_via = (supplier, resource)
+            if best != cumulative[pod_id]:
+                cumulative[pod_id] = best
+                via[pod_id] = best_via
+                changed = True
+        if not changed:
+            break
+
+    return cumulative, via
+
+
+def _classify_survivors(
+    *,
+    trigger: str,
+    affected: set[str],
+    all_pods: dict[str, PodNode],
+    edges: list[DependencyEdge],
+    metadata_signals: list[MetadataSignal],
+    cumulative: dict[str, float | None],
+) -> list[CascadeSurvivor]:
+    """Pods that escape the cascade — either no path from trigger OR enough buffer.
+
+    Type 1 — Independent: no operational edge path from the trigger reaches them.
+    Type 2 — Resilient: reachable but only via low/unknown-criticality edges and
+             holds a RESILIENCE_MARKER buffer >= _SURVIVOR_BUFFER_HOURS.
+    """
+    resilience_by_pod: dict[str, list[MetadataSignal]] = {}
+    for sig in metadata_signals:
+        if sig.signal_type == MetadataSignalType.RESILIENCE_MARKER:
+            resilience_by_pod.setdefault(sig.pod_id, []).append(sig)
+
+    survivors: list[CascadeSurvivor] = []
+
+    for pod_id in all_pods:
+        if pod_id == trigger:
+            continue
+
+        if pod_id not in affected:
+            evidence = [f"no operational dependency path from {trigger}"]
+            for sig in resilience_by_pod.get(pod_id, []):
+                evidence.append(f"metadata:{sig.field}={sig.value}")
+            survivors.append(CascadeSurvivor(
+                pod_id=pod_id,
+                reason="independent — no operational path from trigger",
+                evidence=evidence,
+            ))
+            continue
+
+        # Type 2: reachable, but resilient enough to survive the cascade window
+        resilience = resilience_by_pod.get(pod_id)
+        if not resilience:
+            continue
+
+        out_edges = [
+            e for e in edges
+            if e.source == pod_id and e.state != EdgeState.SUPPLY_ONLY
+            and (e.target == trigger or e.target in affected)
+        ]
+        if not out_edges:
+            continue
+
+        all_low = all(e.criticality.value in ("low", "unknown") for e in out_edges)
+        cum = cumulative.get(pod_id)
+        survives_long = cum is None or cum >= _SURVIVOR_BUFFER_HOURS
+        if not (all_low and survives_long):
+            continue
+
+        targets = ",".join(sorted({e.target for e in out_edges}))
+        evidence = [f"only low-criticality dep into cascade ({targets})"]
+        for sig in resilience:
+            evidence.append(f"metadata:{sig.field}={sig.value}")
+        if cum is not None:
+            evidence.append(f"cumulative_survival={cum:.0f}h")
+        survivors.append(CascadeSurvivor(
+            pod_id=pod_id,
+            reason="resilient — buffer exceeds cascade window",
+            evidence=evidence,
+        ))
+
+    return survivors
+
+
+def _resource_lost_via(
+    G_ops: nx.DiGraph, pod_id: str, trigger: str,
 ) -> tuple[str, str]:
-    """Return (resource, immediate_supplier) for a pod in the cascade."""
-    if hop == 1 and G.has_edge(pod_id, trigger):
-        data = G[pod_id][trigger]
-        return data.get("resource", "unknown"), trigger
+    """Return (resource, immediate_supplier) for a pod in the cascade.
 
-    # Multi-hop: walk the shortest path from pod_id toward trigger
+    For direct dependents, return the edge resource and the trigger as supplier.
+    For multi-hop dependents, walk the shortest path toward the trigger and
+    return the resource on the first hop (the resource this pod *immediately* loses).
+    """
+    if G_ops.has_edge(pod_id, trigger):
+        data = G_ops[pod_id][trigger]
+        return data.get("resource", "unknown"), trigger
     try:
-        path = nx.shortest_path(G, pod_id, trigger)
+        path = nx.shortest_path(G_ops, pod_id, trigger)
         if len(path) >= 2:
-            next_hop = path[1]
-            data = G[pod_id].get(next_hop, {})
-            return data.get("resource", "unknown"), next_hop
+            supplier = path[1]
+            data = G_ops[pod_id].get(supplier, {})
+            return data.get("resource", "unknown"), supplier
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         pass
     return "unknown", trigger
+
+
+def _trigger_reason(
+    trigger: str, structural: dict, risk_scores: dict[str, RiskScore],
+) -> str:
+    if trigger in structural.get("articulation_points", []):
+        return f"Articulation point — removing {trigger} disconnects the colony graph"
+    rs = risk_scores.get(trigger)
+    if rs:
+        return (
+            f"Highest corroborated SPOF — overall_risk={rs.overall_risk:.2f}, "
+            f"corroboration={rs.spof_corroboration_count}/4 independent signals"
+        )
+    return f"Selected by blast radius: {trigger}"
+
+
+def _trigger_corroboration(
+    *,
+    trigger: str,
+    pods: dict[str, PodNode],
+    structural: dict,
+    metadata_signals: list[MetadataSignal],
+    historical_edges: list[HistoricalEdge],
+    risk_scores: dict[str, RiskScore],
+    affected_count: int,
+) -> list[str]:
+    """Human-readable list of independent signals that flag `trigger` as critical."""
+    signals: list[str] = []
+
+    if trigger in structural.get("articulation_points", []):
+        signals.append("articulation_point (graph disconnects without it)")
+
+    no_backup = [
+        s for s in metadata_signals
+        if s.pod_id == trigger and s.signal_type == MetadataSignalType.NO_BACKUP
+    ]
+    for sig in no_backup:
+        signals.append(f"no_backup metadata: {sig.field}={sig.value}")
+
+    hist = [
+        h for h in historical_edges
+        if h.source == trigger or h.target == trigger
+    ]
+    if hist:
+        signals.append(f"{len(hist)} historical dissolutions (redundancy stripped over time)")
+
+    rs = risk_scores.get(trigger)
+    if rs and rs.blast_radius_score > 0:
+        total_pods = max(len(pods) - 1, 1)
+        signals.append(
+            f"blast_radius={rs.blast_radius_score:.0%} "
+            f"(operational cascade reaches {affected_count}/{total_pods})"
+        )
+
+    return signals
 
 
 def _survival_window(pod: PodNode | None, resource: str) -> float | None:
@@ -863,6 +1211,21 @@ async def compute_all_metrics(
     logger.info("=== Metrics Layer B: operational ===")
     operational = _compute_operational(pods, edges, timeline, structural)
 
+    logger.info("=== Metrics: cascade simulation (deterministic) ===")
+    cascade_simulations = _compute_cascades(
+        pods=pods,
+        edges=edges,
+        structural=structural,
+        metadata_signals=operational["metadata_signals"],
+        historical_edges=operational["historical_edges"],
+        risk_scores=operational["risk_scores"],
+    )
+    logger.info(
+        "Cascades: %d simulated (triggers: %s)",
+        len(cascade_simulations),
+        [s.trigger_pod for s in cascade_simulations],
+    )
+
     logger.info("=== Metrics Layer C: LLM enrichment ===")
     llm_signals: list[LLMDerivedSignal] = []
     if api_key:
@@ -885,7 +1248,7 @@ async def compute_all_metrics(
         strongly_connected_components=structural["strongly_connected_components"],
         longest_path=structural["longest_path"],
         blast_radius=structural["blast_radius"],
-        cascade_simulations=structural["cascade_simulations"],
+        cascade_simulations=cascade_simulations,
         highest_blast_radius=structural["highest_blast_radius"],
         # Layer B
         metadata_signals=operational["metadata_signals"],

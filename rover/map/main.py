@@ -316,13 +316,25 @@ async def phase_4_metrics(
             )
 
     for sim in metrics.cascade_simulations:
-        t = sim.time_to_life_critical_hours
+        t_lc  = sim.time_to_life_critical_hours
+        t_cw  = sim.time_to_colony_wide_hours
         logger.info(
-            "  Cascade [%s]: %d pods → life-critical in %s",
+            "  Cascade [%s]: %d pods affected, %d survivors, life-critical=%s colony-wide=%s",
             sim.trigger_pod,
             sim.total_pods_affected,
-            f"{t:.0f}h" if t is not None else "unknown",
+            len(sim.survivors),
+            f"{t_lc:.0f}h" if t_lc is not None else "unknown",
+            f"{t_cw:.0f}h" if t_cw is not None else "unknown",
         )
+        for sig in sim.corroboration_signals:
+            logger.info("      ⚑ %s", sig)
+        if sim.compound_dependents:
+            logger.info(
+                "      ↻ compound (mutual destruction): %s",
+                ", ".join(sim.compound_dependents),
+            )
+        for s in sim.survivors:
+            logger.info("      ✔ survivor %s — %s", s.pod_id, s.reason)
 
     # ── Layer B summary ──────────────────────────────────────────────────
     no_backup = [s for s in metrics.metadata_signals if s.signal_type.value == "no_backup"]
@@ -392,17 +404,35 @@ def _write_phase_4(
         "cascade_simulations": [
             {
                 "trigger":              sim.trigger_pod,
+                "trigger_reason":       sim.trigger_reason,
+                "corroboration":        sim.corroboration_signals,
+                "direct_dependents":    sim.direct_dependents,
+                "compound_dependents":  sim.compound_dependents,
                 "pods_affected":        sim.total_pods_affected,
                 "life_critical_hours":  sim.time_to_life_critical_hours,
+                "colony_wide_hours":    sim.time_to_colony_wide_hours,
                 "steps": [
                     {
-                        "pod_id":        s.pod_id,
-                        "failure_mode":  s.failure_mode,
-                        "hop":           s.hop,
-                        "window_hours":  s.estimated_window_hours,
-                        "life_critical": s.is_life_critical,
+                        "pod_id":            s.pod_id,
+                        "failure_mode":      s.failure_mode,
+                        "hop":               s.hop,
+                        "window_hours":      s.estimated_window_hours,
+                        "cumulative_hours":  s.cumulative_hours,
+                        "lost_resource":     s.lost_resource,
+                        "immediate_supplier": s.immediate_supplier,
+                        "is_life_critical":  s.is_life_critical,
+                        "is_compound":       s.is_compound,
+                        "evidence_source":   s.evidence_source,
                     }
                     for s in sim.steps
+                ],
+                "survivors": [
+                    {
+                        "pod_id":   sv.pod_id,
+                        "reason":   sv.reason,
+                        "evidence": sv.evidence,
+                    }
+                    for sv in sim.survivors
                 ],
             }
             for sim in metrics.cascade_simulations

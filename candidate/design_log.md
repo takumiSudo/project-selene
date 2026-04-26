@@ -1037,3 +1037,172 @@ Six signals were pre-identified from manual config review. Audit results:
 - [x] Artifact bind mount (`.artifacts/` on host)
 - [x] End-to-end test run verified — all 6 signals cross-checked
 - [ ] Reporting phase (`rover/run_reporting.sh` + `rover/report/`)
+
+---
+
+## Session 7 — Cascade Simulation Rewrite
+
+### Context
+
+Manual review of `map.json` against the colony's narrative (Aquifer as transitive SPOF for 10 of 12 pods, mutual-destruction loop with Helios, Sentinel and Nexus as the only survivors) revealed three structural shortcomings of the original cascade design from Session 3 / Decision 16:
+
+1. `cascade_simulations` was **empty** because cascades were gated on `articulation_points`, and the real graph has none (admin-oversight edges from Artemis add enough undirected connectivity).
+2. The blast-radius BFS used **all edges including SUPPLY_ONLY**, inflating Aquifer's reach from the operational truth (10 pods) to the formal-graph value (11 pods including Sentinel via admin oversight).
+3. The cascade had **no compound-failure detection** — it could not surface the Aquifer↔Helios mutual-destruction loop, which is the most important structural feature of the colony.
+
+A reusable, deterministic cascade extractor was added to `metrics.py` rather than the reporter, per Decision 11 (extract signals deterministically; reserve the LLM/reporter for narrative).
+
+---
+
+### Decision 18: Cascade Triggers from Corroborated Risk, Not Articulation Points
+
+**Old gate:** trigger ∈ articulation_points → empty list.
+
+**New selection** (`_select_cascade_triggers`):
+1. Articulation points first (still respected when present).
+2. Pods with `RiskScore.spof_corroboration_count >= 2` in descending `overall_risk`.
+3. Always include the top-1 by `overall_risk` regardless of corroboration.
+4. Top-up with `blast_radius_score >= 0.7` until `_MAX_TRIGGERS=4`.
+
+**Empty-cascade filter:** any trigger whose simulation produces 0 affected pods AND no compound dependents is dropped from the output. This kills false positives like Vault and Artemis, which look high-risk in the formal blast_radius (admin edges) but have no operational dependents.
+
+Result on the live map: triggers = `[aquifer, helios]`. Both cascades are non-empty and informative.
+
+---
+
+### Decision 19: Operational-Edge Graph for Cascade Traversal
+
+**`_build_operational_graph(pods, edges)`** filters edges to `state ∈ {RECONCILED, DEP_ONLY}`, dropping `SUPPLY_ONLY`. Rationale: SUPPLY_ONLY edges are administrative oversight (Artemis claims to "supply" `administrative_oversight` to all pods) and inflate cascades without representing a real resource flow.
+
+The structural-layer blast_radius is unchanged — it still uses the full graph for the formal metric — but the cascade simulator and survivor classifier use the operational view exclusively.
+
+---
+
+### Decision 20: Compound Failure Detection via SCC Membership
+
+A pod is `is_compound=True` in a cascade when it lives in the trigger's strongly-connected component. This surfaces mutual-destruction loops that the cascade BFS otherwise flattens away.
+
+Concrete example from the live map:
+- Aquifer trigger → compound dependents = `{helios, terminus}` because both Helios (needs Aquifer coolant) and Aquifer (needs Helios power, needs Terminus pump components) are in the same SCC.
+- Helios trigger → compound dependents = `{aquifer, terminus}`.
+
+This is a single boolean on `CascadeStep` plus a `compound_dependents: list[str]` on `CascadeSimulation`. The reporter can render compound steps with a different visual marker.
+
+---
+
+### Decision 21: Cumulative Time via Fixed-Point Relaxation
+
+Each `CascadeStep` now carries both `estimated_window_hours` (this pod's own buffer for the lost resource) and `cumulative_hours` (time from T=0 until this pod fails along the fastest path).
+
+**Algorithm** (`_compute_cumulative_times`):
+- Initialise `cumulative[trigger] = 0`, all others = `None`.
+- Relax: for each affected pod, take `min over parents (parent.cumulative + my_window)`.
+- Iterate until no changes (bounded by node count).
+- Track `via[pod_id] = (supplier, resource)` for the *winning* path so `failure_mode` and `lost_resource` are consistent with the timing — not just the graph shortest path.
+
+**Why relaxation, not Dijkstra:** edges with `window=None` (no metadata buffer) can't be Dijkstra-relaxed — they aren't infinite, they're unknown. The relaxation cleanly skips them and keeps the unknown propagation explicit (`cumulative=None` propagates to all downstream nodes that depend only on unknown-buffer paths).
+
+**Key example caught by `via`-tracking:** Medica's cumulative for Helios cascade is **T+10h** via `medical_oxygen` (Zephyr 4h backup_power + Medica 6h oxygen_reserve), NOT via `sterilization_water` (the graph shortest path through Aquifer, which has no timing field). Without via-tracking, `failure_mode` said "loses sterilization_water" while the cumulative was computed against medical_oxygen.
+
+---
+
+### Decision 22: Survivor Classification — Two-Type Model
+
+A survivor is a pod that escapes the cascade. Two types, both encoded in `CascadeSurvivor`:
+
+**Type 1 — Independent:** no operational edge path from trigger reaches the pod. Sentinel against Aquifer is the canonical case (empty `/dependencies`, ice-harvest water, independent solar).
+
+**Type 2 — Resilient:** reachable in the operational graph but holds enough buffer to outlast the cascade window. Conditions:
+- Pod has a `RESILIENCE_MARKER` metadata signal (`independent_*`, `*_reserve_*`, `ice_harvest*`).
+- All operational edges from this pod into the cascade are `low` or `unknown` criticality.
+- Cumulative survival time is either unknown (no timing data) OR ≥ `_SURVIVOR_BUFFER_HOURS` (1 week).
+
+Nexus against either Aquifer or Helios is the canonical Type 2: `independent_power_days=30` (720h) plus its only edge into the cascade is `nexus → helios [low]`.
+
+Survivors are removed from `steps[]` so the cascade narrative correctly stops at the resilient boundary instead of falsely claiming Nexus fails.
+
+---
+
+### Decision 23: Corroboration Signals on Each Cascade
+
+Each `CascadeSimulation` carries a `corroboration_signals: list[str]` of human-readable evidence for why the trigger was selected:
+
+- `articulation_point` (when applicable)
+- `no_backup metadata: <field>=<value>` (one entry per backup-zero metadata signal)
+- `<N> historical dissolutions (redundancy stripped over time)`
+- `blast_radius=<X>% (operational cascade reaches <N>/<total>)`
+
+This collapses the four-corner `RiskScore.spof_corroboration_count` into a list the reporter can quote verbatim. Aquifer's live output: 3 independent signals (`backup_systems=0`, 7 historical dissolutions, blast_radius=100%/9-of-11).
+
+---
+
+### Decision 24: Compute Cascades After Layer B, Not Inside Layer A
+
+The original design ran cascades inside `_compute_structural` (Layer A). The new design runs them as a separate step in `compute_all_metrics`, after `_compute_operational` (Layer B), so they have access to:
+
+- `metadata_signals` — for survivor classification (resilience markers) and corroboration (no_backup signals)
+- `historical_edges` — for corroboration ("N dissolutions stripped redundancy over time")
+- `risk_scores` — for trigger selection
+
+`_compute_structural` no longer returns `cascade_simulations`. The orchestration in `compute_all_metrics` was updated to call `_compute_cascades` between Layers B and C.
+
+---
+
+### Model schema additions (`models.py`)
+
+`CascadeStep` gained four fields (all optional, default-safe):
+- `cumulative_hours: float | None` — time from T=0 along fastest-failure path
+- `is_compound: bool` — pod is in trigger's SCC (mutual destruction)
+- `immediate_supplier: str` — which upstream pod provides the lost resource
+- `lost_resource: str` — explicit resource name (was previously only in `failure_mode`)
+
+`CascadeSurvivor` (new model):
+- `pod_id`, `reason`, `evidence: list[str]` (metadata + structural justifications)
+
+`CascadeSimulation` gained:
+- `corroboration_signals: list[str]`
+- `direct_dependents: list[str]` (hop=1 set, operational)
+- `compound_dependents: list[str]` (in SCC, non-survivor)
+- `survivors: list[CascadeSurvivor]`
+- `time_to_colony_wide_hours: float | None` (max cumulative across all steps)
+
+---
+
+### Live Output — Validation
+
+After rebuild and re-run, `map.json` produces 2 non-empty cascade simulations matching the manual narrative exactly:
+
+**Aquifer cascade:**
+- 9 pods affected, 2 survivors (Nexus, Sentinel)
+- Direct deps (8): artemis, forge, helios, hydroponics, medica, prometheus, terminus, zephyr — matches the 7 reconciled water dependents + 1 stale (prometheus)
+- Compound: `helios, terminus` — confirms mutual destruction
+- Corroboration: `backup_systems=0`, 7 historical dissolutions, blast=100%
+- Most timings unknown (water-resource metadata fields aren't mapped to timing buffers in the data)
+
+**Helios cascade:**
+- 9 pods affected, 2 survivors (same)
+- Compound: `aquifer, terminus`
+- Time to life-critical: **T+4h** (Zephyr loses electrical_power, backup_power_hours=4)
+- Time to colony-wide: **T+10h** (Medica loses medical_oxygen via Zephyr — 4h + 6h oxygen_reserve)
+
+---
+
+### What the cascade simulator does NOT cover (intentional)
+
+- **Helios "degrades within 48h" of losing Aquifer coolant** is not encoded. There is no `battery_thermal_hours` / `coolant_loss_hours` field on Helios. Adding a hardcoded 48h inference would mix synthetic timing into deterministic data; instead, the reporter is expected to narrate this as an inferred window with low confidence, citing `coolant_loop=aquifer-primary` and the 2094-02-14 backup-coolant decommission log.
+- **Multi-trigger correlated failure** (Aquifer + Helios fail simultaneously) is not modelled. Each cascade is rooted at one trigger.
+
+---
+
+## Session 7 — Updated Implementation Status
+
+- [x] Pydantic models extended (CascadeStep new fields, CascadeSurvivor, CascadeSimulation new fields)
+- [x] Cascade extraction moved out of `_compute_structural` into a layer-aware function in `metrics.py`
+- [x] Operational-edge graph filter (drops SUPPLY_ONLY admin oversight)
+- [x] Compound/SCC detection per cascade
+- [x] Cumulative-time relaxation with via-tracking for label consistency
+- [x] Survivor classification (independent + resilient via metadata)
+- [x] Corroboration signal aggregation
+- [x] Phase 4 stdout + JSON artefact updated to surface new fields
+- [x] End-to-end re-run verified — 2 non-empty cascades (aquifer, helios) match manual narrative
+- [ ] Reporting phase (`rover/run_reporting.sh` + `rover/report/`)
