@@ -7,3 +7,5 @@ solutions/
 node_modules/
 *.log
 .DS_Store
+.artifacts/
+.env

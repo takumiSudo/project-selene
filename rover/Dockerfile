@@ -7,9 +7,12 @@ EXPOSE 8080
 
 FROM base
 
-# --- Install your dependencies below ---
-# Example: RUN pip install anthropic httpx networkx
-# Example: RUN npm install -g tsx && npm install openai
+# --- Dependencies ---
+RUN pip install --no-cache-dir \
+    pydantic==2.* \
+    httpx \
+    networkx \
+    anthropic
 
 # --- Copy your code ---
 COPY . /rover/
