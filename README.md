@@ -1,6 +1,6 @@
 # Project Selene
 
-## Start Here
+## Infrastructure Assessment Write Up 
 
 **→ [`candidate/README.md`](candidate/README.md) — the writeup**
 

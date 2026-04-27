@@ -1,6 +1,9 @@
 # Project Selene — Write Up
 ## Design Deliberations and Key Findings
 
+Submission Date - 04/26/2026
+Submitted By - Takumi 
+Audience - Latent Defense Reviewer 
 
 **Submitted artifacts**
 - [`candidate/deliverable/artifact/map.json`](deliverable/artifact/map.json) — full colony map (12 pods, 39 edges, 110 timeline events, 168 KB)
@@ -54,29 +57,29 @@ The project brief asked for three things: discover the colony, map its risks, an
 
 ## Key Design Decisions
 
-**BFS over port scan.** Discovery starts from the gateway and expands outward through declared dependency and supply links. This mirrors the colony topology and produces the shortest-path tree as a side effect — directly useful for failure-propagation depth analysis.
+1. **BFS over port scan.** Discovery starts from the gateway and expands outward through declared dependency and supply links. This mirrors the colony topology and produces the shortest-path tree as a side effect — directly useful for failure-propagation depth analysis.
 
-**Edge reconciliation as a first-class data model.** Every edge carries `declared_by_source`, `declared_by_target`, and a computed `state`. This typed representation turns 39 raw declarations into a structured audit: 23 reconciled, 1 DEP\_ONLY ghost dependency (Prometheus→Aquifer, stale since Oct 2093), 15 SUPPLY\_ONLY administrative relationships. The DEP\_ONLY edge is the single most important fact the agent discovered.
+2. **Edge reconciliation as a first-class data model.** Every edge carries `declared_by_source`, `declared_by_target`, and a computed `state`. This typed representation turns 39 raw declarations into a structured audit: 23 reconciled, 1 DEP\_ONLY ghost dependency (Prometheus→Aquifer, stale since Oct 2093), 15 SUPPLY\_ONLY administrative relationships. The DEP\_ONLY edge is the single most important fact the agent discovered.
 
-**Three-layer metrics, all pre-computed before the reporter runs.** The reporting phase receives structured findings — ranked risk scores, timed cascade steps, verbatim comms quotes with confidence scores — so it can focus entirely on narrative synthesis. Every finding in the report has a traceable source in `map.json`.
+3. **Three-layer metrics, all pre-computed before the reporter runs.** The reporting phase receives structured findings — ranked risk scores, timed cascade steps, verbatim comms quotes with confidence scores — so it can focus entirely on narrative synthesis. Every finding in the report has a traceable source in `map.json`.
 
-**LLM enrichment as a constrained, typed layer (Layer C).** The comms messages contain signal no keyword scanner can reliably surface — engineers describing rerouted water paths, expressing concern about Aquifer capacity. This signal matters. The integration point is typed: the model responds exclusively via a declared tool schema with an enum-constrained `relationship_type`; all pod ID references are post-validated against the ground-truth registry; any signal referencing an unknown pod is dropped. The LLM is treated as a hypothesis generator, not a trusted source.
+4. **LLM enrichment as a constrained, typed layer (Layer C).** The comms messages contain signal no keyword scanner can reliably surface — engineers describing rerouted water paths, expressing concern about Aquifer capacity. This signal matters. The integration point is typed: the model responds exclusively via a declared tool schema with an enum-constrained `relationship_type`; all pod ID references are post-validated against the ground-truth registry; any signal referencing an unknown pod is dropped. The LLM is treated as a hypothesis generator, not a trusted source.
 
-**`prompts.txt` as a versioned artifact.** All LLM instructions live in a plain-text file under version control. Changes to what the model is told are visible in `git diff` and tracked in the design log. This is the difference between a system that can be audited and one that cannot.
+5. **`prompts.txt` as a versioned artifact.** All LLM instructions live in a plain-text file under version control. Changes to what the model is told are visible in `git diff` and tracked in the design log. This is the difference between a system that can be audited and one that cannot.
 
 ---
 
 ## What I'd Do With More Time
 
-**Multi-trigger correlated failure modeling.** The current cascade simulator is single-trigger. The actual worst case — Aquifer and Helios failing simultaneously from a seismic event — produces a dramatically faster timeline. The data structures are ready; the simulation is not.
+1. **Multi-trigger correlated failure modeling.** The current cascade simulator is single-trigger. The actual worst case — Aquifer and Helios failing simultaneously from a seismic event — produces a dramatically faster timeline. The data structures are ready; the simulation is not.
 
-**Prompt version tracking in `map.json`.** Layer C signals in `map.json` do not record which prompt version produced them. Adding a `prompt_version` field to `ExtendedMetrics` would make every run reproducible and diffable across prompt changes.
+2. **Prompt version tracking in `map.json`.** Layer C signals in `map.json` do not record which prompt version produced them. Adding a `prompt_version` field to `ExtendedMetrics` would make every run reproducible and diffable across prompt changes.
 
-**Signal deduplication and retry logic.** If the LLM returns 0 valid signals (all dropped by pod-ID validation), the run silently produces no enrichment. A retry with a narrower context and a deduplication hash on `(source_pod, target_pod, relationship_type)` would make Layer C more robust.
+3. **Signal deduplication and retry logic.** If the LLM returns 0 valid signals (all dropped by pod-ID validation), the run silently produces no enrichment. A retry with a narrower context and a deduplication hash on `(source_pod, target_pod, relationship_type)` would make Layer C more robust.
 
-**Live Phase 3 expansion impact projection.** Aquifer utilization is already at 93%. An agent extension that reads proposed Phase 3 pod specs and projects new demand against Aquifer's rated capacity would directly answer the colony administration's original question — before the expansion breaks something.
+4. **Live Phase 3 expansion impact projection.** Aquifer utilization is already at 93%. An agent extension that reads proposed Phase 3 pod specs and projects new demand against Aquifer's rated capacity would directly answer the colony administration's original question — before the expansion breaks something.
 
-**Evidence quote scrubbing and signal length limits.** The current controls prevent hallucinated IDs and bad citations but don't cap evidence quote length or deduplicate near-identical signals across re-runs. In a production system these are the next tier of non-determinism controls.
+5. **Evidence quote scrubbing and signal length limits.** The current controls prevent hallucinated IDs and bad citations but don't cap evidence quote length or deduplicate near-identical signals across re-runs. In a production system these are the next tier of non-determinism controls.
 
 ---
 
@@ -126,7 +129,8 @@ Through 7 consolidation events in the operational logs (March 2093 to February 2
 
 A failure of Aquifer does not stay at Aquifer.
 
-### Cascade timeline
+### Cascade timeline & Operational Dependency
+
 
 ```mermaid
 graph TD
@@ -173,6 +177,7 @@ zero formal dependencies"]:::survivor
     T0 -.->|isolated| SENTINEL
     T48 -.->|resilient| NEXUS
 ```
+
 
 The T+48h Helios step is an inference grounded in `coolant_loop=aquifer-primary` (Helios metadata) and the decommission of the Vault backup coolant loop (Directive 2094-011). The estimate is configurable: `HELIOS_COOLANT_DEGRADATION_HOURS=48` in the environment.
 
