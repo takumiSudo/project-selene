@@ -1,9 +1,9 @@
 # Project Selene — Write Up
 ## Design Deliberations and Key Findings
 
-Submission Date - 04/26/2026
-Submitted By - Takumi 
-Audience - Latent Defense Reviewer 
+- Submission Date - 04/26/2026
+- Submitted By - Takumi 
+- Audience - Latent Defense Reviewer 
 
 **Submitted artifacts**
 - [`candidate/deliverable/artifact/map.json`](deliverable/artifact/map.json) — full colony map (12 pods, 39 edges, 110 timeline events, 168 KB)
