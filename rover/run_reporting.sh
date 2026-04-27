@@ -1,13 +1,25 @@
 #!/bin/bash
-# Your reporting agent entrypoint.
-# Available environment variables:
-#   GATEWAY_URL  - Colony gateway (http://gateway:3000)
-#   LLM_API_KEY  - Your LLM provider API key
+# Reporting agent entrypoint.
 #
-# Input: /rover/output/map.json (produced by run_mapping.sh)
-# Output: /rover/output/report.md
+# Reads /rover/output/map.json, generates report.md with:
+#   - Executive summary + risk top-3
+#   - LLM-narrated crisis (with deterministic fallback)
+#   - Cascade path + T+0..T+72h timeline
+#   - Survivor profiles
+#   - Six critical signals with verifiable citations
+#   - Reconciliation summary
+#   - LLM-driven recommendations (with deterministic fallback)
+#   - 3 mermaid diagrams (operational graph, cascade waterfall, survivors)
+#   - Methodology appendix with citation-audit summary
 #
-# Analyze the map and produce a Markdown report on your findings.
+# Environment:
+#   GATEWAY_URL  - colony gateway (unused by reporter; reporter reads map.json)
+#   LLM_API_KEY  - optional; if absent, deterministic fallbacks are used
+#   OUTPUT_DIR   - defaults to /rover/output
+#
+# See candidate/design_log.md Sessions 8–9.
 
-echo "TODO: implement your reporting agent"
-exit 1
+set -euo pipefail
+
+cd /rover
+exec python3 -m report.main

@@ -1,22 +1,47 @@
 # Project Selene
 
-A take-home engineering exercise that evaluates systems thinking. You'll build an autonomous agent to discover, map, and analyze a simulated lunar colony — twelve interconnected habitat pods, each running as a Docker container with its own REST API.
+## Infrastructure Assessment Write Up 
 
-This is intentionally open-ended. There is no spec for "done." We're interested in the choices you make, not just the code you write.
+**→ [`candidate/README.md`](candidate/README.md) — the writeup**
 
-## Prerequisites
+TL;DR: the colony is 54 hours from a life-critical failure if Aquifer goes down and only 2 of 12 pods survive. Read the writeup for the full OKRs, design decisions, cascade diagram, and recommendations.
 
-- **Docker** (with `docker compose`) — the entire colony runs as containers
-- **An LLM API key** — Anthropic or OpenAI. Your agent will need it for reasoning over the colony data.
+---
 
-## Getting Started
+## Repo Structure
 
-```bash
-docker compose up --build -d
+```
+candidate/
+  README.md                          ← writeup (start here)
+  deliverable/
+    artifact/
+      map.json                       ← canonical colony map (12 pods, 39 edges, 168 KB)
+      report.md                      ← full assessment report with mermaid diagrams
+    canonical_design_doc.md          ← all architecture decisions across 10 sessions
+    Assessment_Instructions.md       ← original problem brief
+
+rover/
+  map/                               ← mapping agent (BFS discovery, crawler, metrics)
+  report/                            ← reporting agent (deterministic + LLM sections)
+  run_mapping.sh                     ← mapping entrypoint
+  run_reporting.sh                   ← reporting entrypoint
+  Dockerfile
+
+configs/                             ← 12 pod configuration files
+pod-service/                         ← pod REST API server
+gateway/                             ← colony gateway
+docker-compose.yml
+Makefile
 ```
 
-Then open **http://localhost:3000** in your browser.
+---
 
-## Full Instructions
+## Running the Agent
 
-See [candidate/README.md](candidate/README.md) for the complete mission briefing, API reference, and deliverables.
+```bash
+echo "LLM_API_KEY=sk-ant-..." >> .env   # optional — deterministic fallbacks used if absent
+make run                                 # build → start colony → map → report → print
+```
+
+Outputs land in `.artifacts/` and are duplicated to `candidate/deliverable/artifact/`.
+See `candidate/README.md → How to Run` for individual phase commands.

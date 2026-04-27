@@ -1,0 +1,108 @@
+=== CRISIS_NARRATIVE ===
+You are an infrastructure engineer writing a crisis assessment for the Selene
+Lunar Colony — 12 habitat pods, 147 residents.  Over the past ~18 months a
+series of individually-rational consolidations has made Aquifer Module the
+transitive single point of failure for the colony.
+
+Below is the verified evidence gathered from autonomous mapping of all 12 pods.
+Use it — and only it — to write the narrative.  Every factual claim MUST be
+followed by a citation.
+
+CASCADE_DATA
+{cascade_data}
+
+HISTORICAL_DECOMMISSIONS (chronological)
+{historical_data}
+
+KEY_METADATA_SIGNALS
+{metadata_data}
+
+LLM-DERIVED_RELATIONSHIP_SIGNALS
+{llm_data}
+
+CITATION FORMAT — you MUST only use IDs that appear in the catalogs below.
+Do NOT invent or guess citation IDs.
+
+  [pod:logs:POD:ISO_TIMESTAMP]      — from LOG CATALOG below
+  [pod:comms:POD:ISO_TIMESTAMP]     — from COMMS CATALOG below (only listed pods have comms)
+  [edge:SOURCE->TARGET:RESOURCE]    — from EDGE CATALOG below (exact strings only)
+  [directive:DIRECTIVE_ID]          — from DIRECTIVE CATALOG below
+  [pod:metadata:POD:FIELD]          — POD must be a real pod id, FIELD must be a real metadata key
+
+EDGE CATALOG (copy these strings exactly — do not alter SOURCE, TARGET, or RESOURCE):
+{edge_catalog}
+
+DIRECTIVE CATALOG:
+{directive_catalog}
+
+COMMS CATALOG (only these pod:timestamp combinations exist — do not invent others):
+{comms_catalog}
+
+LOG CATALOG (these are all valid log timestamps — use exact strings):
+{log_catalog}
+
+Write 2–3 short paragraphs (no more than 250 words total) that:
+  1. Open with the headline finding.
+  2. Trace the consolidation history chronologically — which redundancy was
+     removed, when, and via which directive.
+  3. Conclude with the present-day operational state.
+
+You MUST call the write_crisis_narrative tool.  Do not produce freeform text.
+=== END ===
+
+=== RECOMMENDATIONS ===
+You are an infrastructure engineer writing remediation recommendations for the
+Selene Lunar Colony based on an autonomous infrastructure assessment.
+
+The data shows a sole-source dependency on Aquifer Module that emerged from
+progressively-stripped redundancy over 18 months.  Your job is to recommend
+concrete actions to restore safety margin before Phase 3 expansion.
+
+CASCADE_DATA
+{cascade_data}
+
+HISTORICAL_DECOMMISSIONS
+{historical_data}
+
+METADATA_SIGNALS
+{metadata_data}
+
+LLM_RELATIONSHIP_SIGNALS
+{llm_data}
+
+CITATION FORMAT — you MUST only use IDs that appear in the catalogs below.
+Do NOT invent or guess citation IDs. Invalid citations will be stripped from
+the published report.
+
+  [pod:logs:POD:ISO_TIMESTAMP]      — from LOG CATALOG below
+  [pod:comms:POD:ISO_TIMESTAMP]     — from COMMS CATALOG below (only listed pods have comms)
+  [edge:SOURCE->TARGET:RESOURCE]    — from EDGE CATALOG below (exact strings only)
+  [directive:DIRECTIVE_ID]          — from DIRECTIVE CATALOG below
+  [pod:metadata:POD:FIELD]          — POD must be a real pod id, FIELD must be a real metadata key
+
+EDGE CATALOG (copy these strings exactly — do not alter SOURCE, TARGET, or RESOURCE):
+{edge_catalog}
+
+DIRECTIVE CATALOG:
+{directive_catalog}
+
+COMMS CATALOG (only these pod:timestamp combinations exist — do not invent others):
+{comms_catalog}
+
+LOG CATALOG:
+{log_catalog}
+
+Generate 5–7 recommendations.  Each must:
+  - Have a verb-led title ("Restore X", "Reactivate Y", "Re-classify Z")
+  - Have a rationale of 1–3 sentences with at least one inline citation
+  - Have an `evidence` list of 1–4 citation strings (each in the exact format
+    above; the citations must be resolvable in the dataset)
+  - Be prioritized: critical | high | medium | low
+  - Have estimated effort: small | medium | large
+
+Prioritize actions that undo specific, dated decommissions when those
+decommissions left the colony with zero redundancy on a life-critical
+resource.  De-prioritize cosmetic or metadata-only fixes.
+
+You MUST call the recommend_actions tool.
+=== END ===
