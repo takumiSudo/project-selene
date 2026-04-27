@@ -32,6 +32,8 @@ from .models import (
     CascadeSimulation,
     CascadeStep,
     CascadeSurvivor,
+    ChainedCascade,
+    ChainedCascadeEvent,
     CommEntry,
     DependencyEdge,
     EdgeState,
@@ -565,6 +567,209 @@ def _classify_survivors(
         ))
 
     return survivors
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHAINED CASCADES — primary trigger + secondary trigger chaining (pessimistic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Inference parameters used when metadata cannot supply a survival window.
+# Keep this list short and well-documented — every entry is a synthetic timing
+# that the reporter must cite explicitly.
+_DEFAULT_INFERENCE_PARAMS: dict[str, float] = {
+    # Helios battery thermal regulation depends on Aquifer coolant. There is no
+    # battery_thermal_hours field on Helios; 48h is the operational rule of
+    # thumb backed by helios.coolant_loop="aquifer-primary" and the
+    # 2094-02-14 backup-coolant decommission log.
+    "helios_coolant_degradation_hours": 48.0,
+}
+
+# Map (resource_lost, secondary_trigger_pod) → inference parameter key.
+# Used only when the primary cascade has no metadata-based timing for that
+# secondary trigger pod.
+_INFERENCE_RULES: list[tuple[str, str, str]] = [
+    ("coolant_water", "helios", "helios_coolant_degradation_hours"),
+]
+
+
+def _compute_chained_cascades(
+    pods: dict[str, PodNode],
+    cascade_simulations: list[CascadeSimulation],
+    inference_params: dict[str, float],
+) -> list[ChainedCascade]:
+    """Chain primary cascades with their secondary triggers' cascades.
+
+    For each primary cascade, identify any pod in its affected set that is
+    itself a cascade trigger. Compute the secondary trigger's failure time
+    (from primary cascade metadata if available, otherwise from inference
+    rules), then graft the secondary's cascade events into the primary
+    timeline using the **pessimistic chaining model**:
+
+        chained.cumulative_hours = secondary_offset + pod.own_buffer
+
+    Production is assumed to halt the moment the supplier fails — a downstream
+    pod does NOT get an extension equal to its supplier's own backup window.
+    See Decision 26 for the rationale.
+    """
+    sim_by_trigger = {s.trigger_pod: s for s in cascade_simulations}
+    chained: list[ChainedCascade] = []
+
+    for primary in cascade_simulations:
+        # Find secondary triggers in primary's affected set
+        secondary_triggers: list[str] = [
+            step.pod_id for step in primary.steps
+            if step.pod_id in sim_by_trigger and step.pod_id != primary.trigger_pod
+        ]
+
+        events: list[ChainedCascadeEvent] = []
+        events_by_pod: dict[str, ChainedCascadeEvent] = {}
+
+        # ── Step 1: copy primary cascade events with their own cumulative_hours
+        for step in primary.steps:
+            evt = ChainedCascadeEvent(
+                pod_id=step.pod_id,
+                cumulative_hours=step.cumulative_hours,
+                lost_resource=step.lost_resource,
+                immediate_supplier=step.immediate_supplier,
+                failure_mode=step.failure_mode,
+                via_primary=True,
+                inference_confidence=("metadata" if step.cumulative_hours is not None else "unknown"),
+                is_life_critical=step.is_life_critical,
+                is_compound=step.is_compound,
+            )
+            events.append(evt)
+            events_by_pod[step.pod_id] = evt
+
+        # ── Step 2: for each secondary trigger, compute offset and graft
+        for sec_trigger in secondary_triggers:
+            sec_sim = sim_by_trigger[sec_trigger]
+            offset, offset_evidence = _secondary_trigger_offset(
+                sec_trigger, primary, inference_params,
+            )
+
+            # Update the secondary trigger's own event with the offset (if better)
+            sec_event = events_by_pod.get(sec_trigger)
+            if sec_event and offset is not None:
+                if sec_event.cumulative_hours is None or offset < sec_event.cumulative_hours:
+                    sec_event.cumulative_hours = offset
+                    sec_event.via_secondary_trigger = sec_trigger
+                    sec_event.secondary_offset_hours = offset
+                    sec_event.secondary_offset_evidence = offset_evidence
+                    sec_event.inference_confidence = (
+                        "inferred" if offset_evidence.startswith("inferred:") else "metadata"
+                    )
+
+            # Graft each secondary cascade step using pessimistic chaining
+            for sec_step in sec_sim.steps:
+                if sec_step.pod_id == primary.trigger_pod:
+                    continue   # don't chain back into the primary trigger
+
+                own_buffer = _survival_window(pods.get(sec_step.pod_id), sec_step.lost_resource)
+                if offset is None or own_buffer is None:
+                    chained_cum: float | None = None
+                else:
+                    chained_cum = offset + own_buffer
+
+                existing = events_by_pod.get(sec_step.pod_id)
+                if existing is None:
+                    new_evt = ChainedCascadeEvent(
+                        pod_id=sec_step.pod_id,
+                        cumulative_hours=chained_cum,
+                        lost_resource=sec_step.lost_resource,
+                        immediate_supplier=sec_step.immediate_supplier,
+                        failure_mode=sec_step.failure_mode,
+                        via_primary=False,
+                        via_secondary_trigger=sec_trigger,
+                        secondary_offset_hours=offset,
+                        secondary_offset_evidence=offset_evidence,
+                        inference_confidence=_inference_confidence(chained_cum, offset_evidence),
+                        is_life_critical=sec_step.is_life_critical,
+                        is_compound=sec_step.is_compound,
+                    )
+                    events.append(new_evt)
+                    events_by_pod[sec_step.pod_id] = new_evt
+                else:
+                    # Take the earlier failure time (and its supporting attribution)
+                    if chained_cum is not None and (
+                        existing.cumulative_hours is None or chained_cum < existing.cumulative_hours
+                    ):
+                        existing.cumulative_hours = chained_cum
+                        existing.lost_resource = sec_step.lost_resource
+                        existing.immediate_supplier = sec_step.immediate_supplier
+                        existing.failure_mode = sec_step.failure_mode
+                        existing.via_secondary_trigger = sec_trigger
+                        existing.secondary_offset_hours = offset
+                        existing.secondary_offset_evidence = offset_evidence
+                        existing.inference_confidence = _inference_confidence(chained_cum, offset_evidence)
+                        existing.is_life_critical = existing.is_life_critical or sec_step.is_life_critical
+
+        # Sort: timed events first by time, untimed last by pod_id
+        events.sort(key=lambda e: (
+            e.cumulative_hours if e.cumulative_hours is not None else 1e9,
+            e.pod_id,
+        ))
+
+        timed = [e.cumulative_hours for e in events if e.cumulative_hours is not None]
+        life_critical_timed = [
+            e.cumulative_hours for e in events
+            if e.is_life_critical and e.cumulative_hours is not None
+        ]
+
+        chained.append(ChainedCascade(
+            primary_trigger=primary.trigger_pod,
+            secondary_triggers=sorted(secondary_triggers),
+            inference_parameters=dict(inference_params),
+            events=events,
+            survivors=primary.survivors,
+            time_to_life_critical_hours=min(life_critical_timed) if life_critical_timed else None,
+            time_to_colony_wide_hours=max(timed) if timed else None,
+        ))
+
+    return chained
+
+
+def _secondary_trigger_offset(
+    secondary_trigger: str,
+    primary_sim: CascadeSimulation,
+    inference_params: dict[str, float],
+) -> tuple[float | None, str]:
+    """When does the secondary trigger fail in the primary cascade timeline?
+
+    Priority:
+      1. Primary cascade has cumulative_hours for this pod from metadata → use it
+      2. Resource-specific inference rule applies → use that
+      3. Return None
+    """
+    primary_step = next(
+        (s for s in primary_sim.steps if s.pod_id == secondary_trigger), None,
+    )
+    if primary_step is None:
+        return None, ""
+
+    # Case 1: metadata-derived
+    if primary_step.cumulative_hours is not None:
+        evidence = (
+            f"metadata:{primary_step.evidence_source}"
+            if primary_step.evidence_source else "metadata"
+        )
+        return primary_step.cumulative_hours, evidence
+
+    # Case 2: inference rule
+    for resource, sec_pod, param_key in _INFERENCE_RULES:
+        if primary_step.lost_resource == resource and secondary_trigger == sec_pod:
+            hours = inference_params.get(param_key)
+            if hours is not None:
+                return float(hours), f"inferred:{param_key}={hours}"
+
+    return None, ""
+
+
+def _inference_confidence(value: float | None, evidence: str) -> str:
+    if value is None:
+        return "unknown"
+    if evidence.startswith("inferred:"):
+        return "inferred"
+    return "metadata"
 
 
 def _resource_lost_via(
@@ -1202,8 +1407,15 @@ async def compute_all_metrics(
     timeline: list[LogEntry | CommEntry],
     reconciliation_issues: list[ReconciliationIssue],
     api_key: str | None = None,
+    inference_parameters: dict[str, float] | None = None,
 ) -> ExtendedMetrics:
     """Compute all three metric layers and return a fully populated ExtendedMetrics."""
+
+    # Always start from the documented defaults and let the caller override.
+    merged_params = dict(_DEFAULT_INFERENCE_PARAMS)
+    if inference_parameters:
+        merged_params.update(inference_parameters)
+    inference_parameters = merged_params
 
     logger.info("=== Metrics Layer A: structural ===")
     structural = _compute_structural(pods, edges)
@@ -1225,6 +1437,21 @@ async def compute_all_metrics(
         len(cascade_simulations),
         [s.trigger_pod for s in cascade_simulations],
     )
+
+    logger.info("=== Metrics: chained cascades (pessimistic chaining) ===")
+    chained_cascades = _compute_chained_cascades(
+        pods=pods,
+        cascade_simulations=cascade_simulations,
+        inference_params=inference_parameters,
+    )
+    for cc in chained_cascades:
+        logger.info(
+            "  Chain [%s] secondary=%s life_critical=%s colony_wide=%s",
+            cc.primary_trigger,
+            cc.secondary_triggers,
+            f"{cc.time_to_life_critical_hours:.0f}h" if cc.time_to_life_critical_hours is not None else "?",
+            f"{cc.time_to_colony_wide_hours:.0f}h" if cc.time_to_colony_wide_hours is not None else "?",
+        )
 
     logger.info("=== Metrics Layer C: LLM enrichment ===")
     llm_signals: list[LLMDerivedSignal] = []
@@ -1249,6 +1476,7 @@ async def compute_all_metrics(
         longest_path=structural["longest_path"],
         blast_radius=structural["blast_radius"],
         cascade_simulations=cascade_simulations,
+        chained_cascades=chained_cascades,
         highest_blast_radius=structural["highest_blast_radius"],
         # Layer B
         metadata_signals=operational["metadata_signals"],

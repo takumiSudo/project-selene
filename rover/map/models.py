@@ -175,6 +175,44 @@ class CascadeSimulation(BaseModel):
     time_to_colony_wide_hours: float | None = None    # max cumulative — when everyone has fallen
 
 
+class ChainedCascadeEvent(BaseModel):
+    """One event in a chained cascade timeline.
+
+    Combines events from a primary cascade with secondary cascades that fire
+    when their trigger pod fails as part of the primary's progression.
+    """
+    pod_id: str
+    cumulative_hours: float | None = None        # T from primary trigger T=0
+    lost_resource: str = ""
+    immediate_supplier: str = ""
+    failure_mode: str = ""
+    via_primary: bool = True                     # event came from the primary cascade
+    via_secondary_trigger: str | None = None     # secondary trigger that produced (or improved) this event
+    secondary_offset_hours: float | None = None  # T at which the secondary trigger fired
+    secondary_offset_evidence: str = ""           # "metadata:..." or "inferred:<param>=<value>"
+    inference_confidence: str = "metadata"       # "metadata" | "inferred" | "unknown"
+    is_life_critical: bool = False
+    is_compound: bool = False
+
+
+class ChainedCascade(BaseModel):
+    """Multi-trigger cascade: a primary trigger fires secondary triggers via its
+    own dependents, producing a unified colony-wide timeline.
+
+    Uses the pessimistic chaining model: a downstream pod's failure time is
+    `secondary_trigger.failure_time + own_buffer_for_lost_resource`, NOT a sum
+    of intermediate buffers.  Production is assumed to halt the moment the
+    upstream supplier fails.  See design_log.md Decision 26.
+    """
+    primary_trigger: str
+    secondary_triggers: list[str] = Field(default_factory=list)
+    inference_parameters: dict[str, float] = Field(default_factory=dict)
+    events: list[ChainedCascadeEvent] = Field(default_factory=list)
+    survivors: list[CascadeSurvivor] = Field(default_factory=list)
+    time_to_life_critical_hours: float | None = None
+    time_to_colony_wide_hours: float | None = None
+
+
 # ---------------------------------------------------------------------------
 # Computed structures — Layer B (operational / metadata + logs)
 # ---------------------------------------------------------------------------
@@ -259,6 +297,7 @@ class ExtendedMetrics(BaseModel):
 
     blast_radius: dict[str, BlastRadiusEntry] = Field(default_factory=dict)
     cascade_simulations: list[CascadeSimulation] = Field(default_factory=list)
+    chained_cascades: list[ChainedCascade] = Field(default_factory=list)
 
     # ── Layer B: operational (metadata + logs) ───────────────────────────
     metadata_signals: list[MetadataSignal] = Field(default_factory=list)

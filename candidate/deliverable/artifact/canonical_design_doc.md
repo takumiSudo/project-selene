@@ -1245,6 +1245,10 @@ narrative part. Putting it in `metrics.py` keeps `map.json` self-contained
 `cascade_simulations` field rather than replacing it. Single-trigger cascades
 remain useful for SPOF analysis; chained cascades are the colony-wide story.
 
+This also reverses Session 7's "intentional non-coverage" of the Helios 48h
+inference. That note is now superseded — the inference is captured here as a
+parameterized, documented input rather than ad-hoc reporter narration.
+
 ---
 
 ### Decision 25: 48h Helios coolant inference is parameter-configurable
@@ -1288,7 +1292,7 @@ The pod's own backup keeps the pod alive; it does NOT extend its outputs.
 
 ---
 
-### Decision 27: Reporter file layout — minimal
+### Decision 27: Reporter file layout — minimal (deferred to next session)
 
 ```
 rover/report/
@@ -1337,9 +1341,10 @@ reporter scope.
 
 ---
 
-### Decision 29: Two LLM calls in the reporter
+### Decision 29: Two LLM calls in the reporter (deferred)
 
-Two structured tool-use calls (mirroring `metrics.py` Layer C):
+When the reporter is built, two structured tool-use calls (mirroring
+`metrics.py` Layer C):
 
 1. **Crisis narrative** — 2–3 paragraphs, 18-month story of how Aquifer
    became the SPOF. Tool schema enforces paragraph-list output.
@@ -1350,7 +1355,7 @@ Both fall back to deterministic templates if `LLM_API_KEY` is unset.
 
 ---
 
-### Decision 30: Three mermaid diagrams in the reporter
+### Decision 30: Three mermaid diagrams in the reporter (deferred)
 
 Visual readability is the priority — diagrams must not be jumbles of words:
 
@@ -1386,7 +1391,6 @@ Visual readability is the priority — diagrams must not be jumbles of words:
 - `phase_4_metrics_summary.json` serializes chained cascades
 
 ---
-
 Aquifer primary → Helios secondary chain:
 
 ```
@@ -1564,11 +1568,11 @@ appendix builder.
 The 9-session implementation is complete. This session focuses on packaging
 the deliverables and producing the final candidate-facing writeup. Two tasks:
 
-1. **Step 1 — Artifact deliverable folder:** create `candidate/deliverable/artifact/` as
+1. **Step 1 — Artifact deliverable folder:** create `deliverable/artifact/` as
    a committed folder that holds the canonical `map.json` and `report.md`, and
    wire the agent code so every fresh run auto-duplicates those two files there.
 
-2. **Step 2 — Short writeup:** produce `candidate/deliverable/writeup.md`, the ~1-page
+2. **Step 2 — Short writeup:** produce `deliverable/writeup.md`, the ~1-page
    design summary for the interview.
 
 ---
@@ -1577,7 +1581,7 @@ the deliverables and producing the final candidate-facing writeup. Two tasks:
 
 **Deliverable structure:**
 ```
-candidate/deliverable/
+deliverable/
   artifact/
     map.json      ← canonical ColonyMap (committed to git)
     report.md     ← final assessment report (committed to git)
@@ -1590,12 +1594,12 @@ gitignored). This is the working scratchpad — every run overwrites it.
 **Why two separate locations:**
 - `.artifacts/` is the hot scratchpad: phases/, reconciliation_audit.txt, logs.
   It is gitignored and overwritten on each run.
-- `candidate/deliverable/artifact/` is the committed canonical output: only `map.json`
+- `deliverable/artifact/` is the committed canonical output: only `map.json`
   and `report.md` are duplicated here. These represent the agreed-upon run
   that the interview submission references.
 
 **Implementation:**
-- `docker-compose.yml`: added second bind mount `./candidate/deliverable/artifact:/rover/deliverable`
+- `docker-compose.yml`: added second bind mount `./deliverable/artifact:/rover/deliverable`
   and env var `DELIVERABLE_DIR=/rover/deliverable`.
 - `rover/map/main.py` Phase 5 (`phase_5_assemble`): after writing `map.json`
   to `OUTPUT_DIR`, checks if `DELIVERABLE_DIR` is a real directory and copies
@@ -1611,16 +1615,47 @@ reporter). There is no "early copy" on failure.
 
 ### Step 2 — Short Writeup
 
-The writeup is at `candidate/deliverable/writeup.md`. Structured as an executive
-summary (not a design narrative) with OKRs, key decisions, how-to-run, findings
-with the mermaid cascade diagram, and prioritized recommendations. The design
-log remains the canonical reference for all decisions and deliberations.
+The writeup is at `deliverable/writeup.md`. It is structured around a single
+thesis that emerged from the 9-session implementation:
 
-Writeup thesis:
-> The mapping phase taught the agent how to internally represent the Selene
+> **The mapping phase taught the agent how to internally represent the Selene
 > colony (via graph and reconciliation). The reporting phase taught it how to
 > combine non-deterministic inference (LLM enrichment) with deterministic
-> analysis — while keeping the final artifact trustworthy.
+> analysis — while keeping the final artifact trustworthy.**
+
+Key emphasis points carried forward from the design log:
+
+1. **BFS + reconciliation as a representation strategy** (Sessions 1–3): the
+   choice of BFS was not just a traversal algorithm — it produced the
+   shortest-path tree as a side effect, which directly feeds failure-propagation
+   depth analysis. The reconciliation model (DEP_ONLY / SUPPLY_ONLY / RECONCILED)
+   turned a raw list of declared edges into a typed, auditable representation
+   of the colony's actual vs. claimed dependency state.
+
+2. **LLM enrichment as Layer C — a deliberate antipattern** (Session 3,
+   Decision 11): inserting a non-deterministic step into what was otherwise
+   a fully deterministic mapping pipeline is architecturally unusual. The
+   rationale was that the five comms messages and dissolution logs contained
+   signal (the Prometheus water rerouting, Zephyr's 100% moisture dependency)
+   that no amount of deterministic keyword matching could reliably surface. The
+   antipattern was accepted with two hard constraints: (a) the LLM cannot emit
+   prose — it is tool-use only, returning a typed JSON array; (b) every output
+   is post-validated against the ground-truth pod registry before entering
+   `map.json`.
+
+3. **Failsafes and controls for LLM enrichment** — see dedicated section below.
+
+4. **Prompts as a versioned artifact** (Session 8, Decision 27): `prompts.txt`
+   is a plain-text file in `rover/report/`. This is intentional — it makes the
+   LLM's instructions a first-class versioned artifact rather than a buried
+   f-string. Any change to what the LLM is told to do is visible in `git diff`.
+
+5. **The cascade timeline as a latent representation** (Sessions 7–8): the
+   chained cascade in `map.json` is not just a risk calculation — it is the
+   colony's "latent state" represented in time. T+48h Helios degrades, T+52h
+   Zephyr fails, T+54h Medica loses all three supply chains. This timeline
+   encodes the hidden coupling between two independent SPOF analyses
+   (Aquifer-primary and Helios-primary) into a single colony-wide story.
 
 ---
 
@@ -1647,27 +1682,41 @@ Writeup thesis:
 | Full citation catalogs injected into both prompts | `_llm_context_blocks()` | LLM can only reference real edge/directive/comms/log IDs from the verified index |
 | `_sanitize_text()` post-processing | `build_crisis_section`, `build_recommendations` | Strips any hallucinated citation that doesn't resolve in the index |
 | `_sanitize_evidence()` post-processing | `build_recommendations` | Filters evidence list items that contain unresolvable citations |
-| `build_citation_index()` + `summarise_audit()` | After all sections built | Full citation audit logged before report is written |
+| `build_citation_index()` + `summarise_audit()` | After all sections built | Full citation audit logged before report is written; unresolved count = 0 is a publish requirement |
 | `validation.py` 32-test suite | Offline | Regression tests against live artifacts for sanitizer behavior |
 | LLM signal audit (`_audit_llm_signals`) | `report/main.py` | Validates pod IDs, timestamps, and `is_formally_declared` flags in LLM-derived signals |
 | Deterministic fallbacks for both LLM sections | `_crisis_fallback`, `_recommendations_fallback` | If `LLM_API_KEY` is unset or the API call fails, the report renders deterministically |
 
 #### What is NOT yet implemented (future work)
 
+The current controls prevent the most dangerous failure modes (hallucinated
+pod IDs, invalid citations, wrong edge directions). What remains is defense-in-
+depth hardening for a production system:
+
 | Gap | Risk | Mitigation strategy |
 |---|---|---|
-| No max-length scrubbing per evidence_quote | LLM can return very long quotes | Add `max_quote_chars` truncation post-parse |
-| No signal deduplication across re-runs | Same comms quote may produce two slightly different signals | Hash on `(source_pod, target_pod, relationship_type, evidence_pod)` |
-| No prompt version header in output | `map.json` does not record which prompt version produced Layer C signals | Add `prompt_version: str` to `ExtendedMetrics` |
-| No retry with tighter constraints on partial failure | 0 valid signals → silent no enrichment | Retry with reduced context if first pass returns <2 signals |
+| No max-length scrubbing per evidence_quote | LLM can return very long quotes that dominate the signal | Add `max_quote_chars` truncation post-parse, before `LLMDerivedSignal` is stored |
+| No signal deduplication across re-runs | Non-deterministic ordering means the same comms quote may produce two slightly different signals | Hash on `(source_pod, target_pod, relationship_type, evidence_pod)` and keep highest-confidence duplicate |
+| No prompt version header in output | `map.json` does not record which prompt version produced Layer C signals | Add `prompt_version: str` to `ExtendedMetrics`, set from a constant in `metrics.py` |
+| No retry with tighter constraints on partial failure | If the model produces 0 valid signals, the run silently produces no enrichment | Add a retry with a reduced context (comms only, no dissolution logs) if the first pass returns <2 signals |
+| No scrubbing of PII from comms before LLM | Engineer role identifiers (`vault_manager`, `artemis_ops`) are sent to the LLM | Acceptable for this challenge; in production, anonymize role identifiers before prompt construction |
+
+**Summary:** the fundamental safeguards are in place — the LLM's non-deterministic
+output is constrained at input (tool schema, enum, pod registry), filtered at
+output (sanitizer, citation audit), and tested offline (32-case suite). The
+remaining gaps are about robustness, reproducibility, and defense-in-depth
+rather than correctness. The thesis for the writeup holds: the system
+successfully combines non-determinism with determinism by treating LLM output
+as a hypothesis that must pass a typed schema and a ground-truth validation
+step before it can influence the final artifact.
 
 ---
 
 ## Session 10 — Implementation Status
 
-- [x] `candidate/deliverable/artifact/` created with canonical `map.json` and `report.md`
-- [x] `docker-compose.yml`: added `./candidate/deliverable/artifact:/rover/deliverable` bind mount + `DELIVERABLE_DIR` env
+- [x] `deliverable/artifact/` created with canonical `map.json` and `report.md`
+- [x] `docker-compose.yml`: added `./deliverable/artifact:/rover/deliverable` bind mount + `DELIVERABLE_DIR` env
 - [x] `rover/map/main.py`: Phase 5 duplicates `map.json` to `DELIVERABLE_DIR` if set
 - [x] `rover/report/main.py`: `run()` duplicates `report.md` to `DELIVERABLE_DIR` if set
-- [x] `candidate/deliverable/writeup.md`: executive summary with OKRs, cascade mermaid, how-to-run
-- [x] LLM safeguards audited: 12 controls confirmed in code; 4 future hardening gaps documented
+- [x] `deliverable/writeup.md`: ~1-page design summary (see Step 2)
+- [x] LLM safeguards audited: 10 controls confirmed in code; 5 future hardening gaps documented

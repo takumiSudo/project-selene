@@ -150,8 +150,10 @@ services:
       - "8080:8080"
     volumes:
       - ./.artifacts:/rover/output
+      - ./candidate/deliverable/artifact:/rover/deliverable
     environment:
       - LLM_API_KEY=${LLM_API_KEY}
       - GATEWAY_URL=http://gateway:3000
+      - DELIVERABLE_DIR=/rover/deliverable
     networks:
       - selene-net

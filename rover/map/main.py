@@ -50,9 +50,22 @@ from .models import (
 # Configuration (all overridable — tested code passes these as params)
 # ---------------------------------------------------------------------------
 
-DEFAULT_GATEWAY_URL  = os.environ.get("GATEWAY_URL",  "http://gateway:3000")
-DEFAULT_OUTPUT_DIR   = Path(os.environ.get("OUTPUT_DIR", "/rover/output"))
-DEFAULT_LLM_API_KEY  = os.environ.get("LLM_API_KEY")
+DEFAULT_GATEWAY_URL    = os.environ.get("GATEWAY_URL",  "http://gateway:3000")
+DEFAULT_OUTPUT_DIR     = Path(os.environ.get("OUTPUT_DIR", "/rover/output"))
+DEFAULT_LLM_API_KEY    = os.environ.get("LLM_API_KEY")
+DEFAULT_DELIVERABLE_DIR = Path(os.environ.get("DELIVERABLE_DIR", "")) if os.environ.get("DELIVERABLE_DIR") else None
+
+
+def _inference_params_from_env() -> dict[str, float]:
+    """Read overridable cascade-chaining inference parameters from env vars."""
+    params: dict[str, float] = {}
+    raw = os.environ.get("HELIOS_COOLANT_DEGRADATION_HOURS")
+    if raw:
+        try:
+            params["helios_coolant_degradation_hours"] = float(raw)
+        except ValueError:
+            logger.warning("Ignoring non-numeric HELIOS_COOLANT_DEGRADATION_HOURS=%r", raw)
+    return params
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -295,11 +308,15 @@ async def phase_4_metrics(
     timeline: list[LogEntry | CommEntry],
     issues: list[ReconciliationIssue],
     api_key: str | None = None,
+    inference_parameters: dict[str, float] | None = None,
 ) -> ExtendedMetrics:
     """Three-layer metrics: structural (networkx), operational (metadata+logs), LLM enrichment."""
     _phase_header(4, "Metrics")
 
-    metrics = await compute_all_metrics(pods, edges, timeline, issues, api_key)
+    metrics = await compute_all_metrics(
+        pods, edges, timeline, issues, api_key,
+        inference_parameters=inference_parameters,
+    )
 
     # ── Layer A summary ──────────────────────────────────────────────────
     art = metrics.articulation_points
@@ -335,6 +352,24 @@ async def phase_4_metrics(
             )
         for s in sim.survivors:
             logger.info("      ✔ survivor %s — %s", s.pod_id, s.reason)
+
+    # ── Chained cascades (pessimistic colony-wide timeline) ──────────────
+    for cc in metrics.chained_cascades:
+        logger.info(
+            "  Chained [%s] secondary=%s life_critical=%s colony_wide=%s",
+            cc.primary_trigger,
+            cc.secondary_triggers,
+            f"{cc.time_to_life_critical_hours:.0f}h" if cc.time_to_life_critical_hours is not None else "?",
+            f"{cc.time_to_colony_wide_hours:.0f}h" if cc.time_to_colony_wide_hours is not None else "?",
+        )
+        for evt in cc.events:
+            t = f"T+{evt.cumulative_hours:.0f}h" if evt.cumulative_hours is not None else "T+?"
+            via = f" via {evt.via_secondary_trigger}" if evt.via_secondary_trigger else ""
+            conf = f" [{evt.inference_confidence}]"
+            logger.info(
+                "      %-7s %-12s loses '%s' from %s%s%s",
+                t, evt.pod_id, evt.lost_resource, evt.immediate_supplier, via, conf,
+            )
 
     # ── Layer B summary ──────────────────────────────────────────────────
     no_backup = [s for s in metrics.metadata_signals if s.signal_type.value == "no_backup"]
@@ -436,6 +471,34 @@ def _write_phase_4(
                 ],
             }
             for sim in metrics.cascade_simulations
+        ],
+        "chained_cascades": [
+            {
+                "primary_trigger":          cc.primary_trigger,
+                "secondary_triggers":       cc.secondary_triggers,
+                "inference_parameters":     cc.inference_parameters,
+                "time_to_life_critical_hours": cc.time_to_life_critical_hours,
+                "time_to_colony_wide_hours":   cc.time_to_colony_wide_hours,
+                "events": [
+                    {
+                        "pod_id":            evt.pod_id,
+                        "cumulative_hours":  evt.cumulative_hours,
+                        "lost_resource":     evt.lost_resource,
+                        "immediate_supplier": evt.immediate_supplier,
+                        "failure_mode":      evt.failure_mode,
+                        "via_primary":       evt.via_primary,
+                        "via_secondary_trigger": evt.via_secondary_trigger,
+                        "secondary_offset_hours": evt.secondary_offset_hours,
+                        "secondary_offset_evidence": evt.secondary_offset_evidence,
+                        "inference_confidence": evt.inference_confidence,
+                        "is_life_critical":  evt.is_life_critical,
+                        "is_compound":       evt.is_compound,
+                    }
+                    for evt in cc.events
+                ],
+                "survivors": [sv.pod_id for sv in cc.survivors],
+            }
+            for cc in metrics.chained_cascades
         ],
         "metadata_signals": {
             "no_backup":          [s.model_dump() for s in metrics.metadata_signals if s.signal_type.value == "no_backup"],
@@ -639,6 +702,12 @@ def phase_5_assemble(
         len(colony_map.timeline),
         size_kb,
     )
+
+    if DEFAULT_DELIVERABLE_DIR and DEFAULT_DELIVERABLE_DIR.is_dir():
+        import shutil
+        shutil.copy2(out_path, DEFAULT_DELIVERABLE_DIR / "map.json")
+        logger.info("map.json duplicated → %s/map.json", DEFAULT_DELIVERABLE_DIR)
+
     return colony_map
 
 
@@ -650,12 +719,16 @@ async def run(
     gateway_url: str = DEFAULT_GATEWAY_URL,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     api_key: str | None = DEFAULT_LLM_API_KEY,
+    inference_parameters: dict[str, float] | None = None,
 ) -> ColonyMap:
     """Run all five phases and return the completed ColonyMap.
 
     Parameters are explicit so test code can inject alternatives without
     touching environment variables.
     """
+    if inference_parameters is None:
+        inference_parameters = _inference_params_from_env()
+
     output_dir.mkdir(parents=True, exist_ok=True)
     phases_dir = output_dir / "phases"
     phases_dir.mkdir(exist_ok=True)
@@ -666,6 +739,8 @@ async def run(
     logger.info("  Gateway:  %s", gateway_url)
     logger.info("  Output:   %s", output_dir)
     logger.info("  LLM key:  %s", "configured" if api_key else "not set — Layer C will be skipped")
+    if inference_parameters:
+        logger.info("  Inference overrides: %s", inference_parameters)
     logger.info("  Started:  %s", started.strftime("%H:%M:%S UTC"))
     logger.info("═" * 60)
 
@@ -690,7 +765,10 @@ async def run(
     _write_phase_3(timeline, phases_dir)
 
     # ── Phase 4: Metrics ──────────────────────────────────────────────────
-    metrics = await phase_4_metrics(pods, edges, timeline, issues, api_key)
+    metrics = await phase_4_metrics(
+        pods, edges, timeline, issues, api_key,
+        inference_parameters=inference_parameters,
+    )
     _write_phase_4(metrics, pods, phases_dir)
 
     # Reconciliation audit (needs Phase 4 context for LLM + historical cross-ref)
